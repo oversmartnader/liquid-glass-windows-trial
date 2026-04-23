@@ -18,9 +18,8 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "ole32.lib") // Required for CoInitializeEx
 
-// Added for newer Windows capture exclusion
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
@@ -45,7 +44,6 @@ struct CBPerFrame {
     float pad;
 };
 
-// Global COM Objects
 ComPtr<ID3D11Device>             g_device;
 ComPtr<ID3D11DeviceContext>      g_ctx;
 ComPtr<IDXGISwapChain>           g_swapChain;
@@ -62,7 +60,7 @@ ComPtr<ID3D11SamplerState>       g_sampler;
 ComPtr<ID3D11BlendState>         g_blendState;
 ComPtr<ID3D11RasterizerState>    g_rsState;
 
-// --- SHADERS ---
+// --- VERTEX SHADER ---
 static const char* g_vsSource = R"(
 struct VSIn {
     float3 pos : POSITION;
@@ -80,6 +78,7 @@ VSOut main(VSIn i) {
 }
 )";
 
+// --- PIXEL SHADER (1:1 Translation of Article Theory) ---
 static const char* g_psSource = R"(
 Texture2D    gTex    : register(t0);
 SamplerState gSampler: register(s0);
@@ -91,85 +90,84 @@ cbuffer CBPerFrame : register(b0) {
     float gPad;
 };
 
-float sdRoundBox(float2 p, float2 b, float r) {
-    float2 q = abs(p) - b + r;
-    return length(max(q, 0.0f)) + min(max(q.x, q.y), 0.0f) - r;
+// Step 1: Background Sampling Helper
+// Note: Uses SampleLevel to prevent gradient compilation errors inside for-loops in D3D11
+float3 getTextureColorAt(float2 coord) {
+    float2 uv = coord / float2(gWidth, gHeight);
+    return gTex.SampleLevel(gSampler, uv, 0).rgb;
 }
 
-float3 LiquidGlass(float2 uv, float2 resolution, float time) {
-    float2 p = uv * resolution;
-    float2 center = resolution * 0.5f;
-    float2 rel = p - center;
-    float2 boxSize = float2(resolution.x * 0.42f, resolution.y * 0.42f);
-    float radius = 38.0f;
-    float dist = sdRoundBox(rel, boxSize, radius);
+// Step 2: The SDF Function
+float sdf(float2 p, float2 b, float r) {
+    float2 d = abs(p) - b + float2(r, r);
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;   
+}
 
-    float edge = 1.0f - smoothstep(-1.5f, 1.5f, dist);
-    float innerMask = 1.0f - smoothstep(-2.0f, 0.0f, dist);
-
-    float2 norm = normalize(rel + float2(0.001f, 0.001f));
-    float len = length(rel);
-    float2 boxN = rel / (boxSize + radius);
-
-    float wave1 = sin(uv.x * 7.0f + time * 1.1f) * 0.012f;
-    float wave2 = cos(uv.y * 6.0f + time * 0.9f) * 0.010f;
-    float wave3 = sin((uv.x + uv.y) * 5.0f + time * 1.3f) * 0.008f;
-
-    float rimFactor = smoothstep(0.55f, 1.0f, length(boxN));
-    float2 refract = float2(
-        wave1 + wave3 + boxN.x * rimFactor * 0.018f,
-        wave2 + wave3 + boxN.y * rimFactor * 0.018f
-    );
-
-    float2 distUV = uv + refract * innerMask;
-    distUV = clamp(distUV, 0.001f, 0.999f);
-    float3 bgColor = gTex.Sample(gSampler, distUV).rgb;
-
-    float blurStrength = 0.004f;
-    float3 blurred = float3(0,0,0);
-    int samples = 9;
-    float2 px = float2(1.0f/gWidth, 1.0f/gHeight);
+// Step 5: Implementing Gaussian Blur
+float3 getBlurredColor(float2 coord, float blurRadius) {
+    float3 color = float3(0.0, 0.0, 0.0);
+    float totalWeight = 0.0;
     
-    for(int x=-1;x<=1;x++){
-        for(int y=-1;y<=1;y++){
-            float2 off = float2(x,y)*px*blurStrength*120.0f;
-            blurred += gTex.Sample(gSampler, clamp(distUV+off,0.001f,0.999f)).rgb;
+    [unroll(25)]
+    for (int x = -2; x <= 2; x++) {
+        [unroll(5)]
+        for (int y = -2; y <= 2; y++) {
+            float2 offset = float2((float)x, (float)y) * blurRadius;
+            float weight = exp(-0.5 * (float)(x*x + y*y) / 2.0);
+            
+            color += getTextureColorAt(coord + offset) * weight;
+            totalWeight += weight;
         }
     }
-    blurred /= float(samples);
-
-    float3 glassColor = lerp(bgColor, blurred, 0.72f);
-    glassColor = lerp(glassColor, float3(0.96f,0.97f,1.0f), 0.13f);
-
-    float3 lightDir = normalize(float3(-0.6f, -0.8f, 1.0f));
-    float3 normal3D = normalize(float3(boxN.x, boxN.y, 0.5f));
-    float spec = pow(max(dot(normal3D, lightDir),0.0f), 22.0f);
-    float rimLight = pow(1.0f - max(dot(normalize(float3(rel,0.3f)), float3(0,0,1)),0.0f), 3.5f);
-
-    float highlight1 = exp(-length(rel - float2(-boxSize.x*0.28f, -boxSize.y*0.32f)) / 38.0f);
-    float highlight2 = exp(-length(rel - float2( boxSize.x*0.18f,  boxSize.y*0.25f)) / 55.0f);
-    float shimmer = sin(time*2.2f + uv.x*11.0f)*0.5f+0.5f;
-    float shimmer2= cos(time*1.7f + uv.y*9.0f )*0.5f+0.5f;
-
-    glassColor += spec * 0.55f * float3(1.0f,1.0f,1.0f);
-    glassColor += rimLight * 0.09f * float3(0.8f,0.9f,1.0f);
-    glassColor += highlight1 * 0.18f * float3(1.0f,1.0f,1.0f) * (0.7f+0.3f*shimmer);
-    glassColor += highlight2 * 0.10f * float3(0.9f,0.95f,1.0f)* (0.7f+0.3f*shimmer2);
-
-    float borderGlow = exp(-abs(dist)*0.12f) * (dist < 0.0f ? 0.0f : 1.0f);
-    glassColor += borderGlow * float3(0.85f,0.92f,1.0f) * 0.22f;
-
-    float alpha = innerMask;
-    return glassColor * alpha + bgColor * (1.0f - alpha);
+    
+    return color / totalWeight;
 }
 
-float4 main(float4 svpos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    float3 col = LiquidGlass(uv, float2(gWidth, gHeight), gTime);
-    return float4(col, 1.0f);
+float4 main(float4 svpos : SV_POSITION, float2 in_uv : TEXCOORD0) : SV_TARGET {
+    float2 fragCoord = in_uv * float2(gWidth, gHeight);
+    
+    // Size the glass slightly smaller than the window to show the shape
+    float2 glassSize = float2(gWidth * 0.85, gHeight * 0.85);
+    float2 glassCenter = float2(gWidth * 0.5, gHeight * 0.5);
+    float2 glassCoord = fragCoord - glassCenter;
+  
+    float size = min(glassSize.x, glassSize.y);
+    float inversedSDF = -sdf(glassCoord, glassSize * 0.5, 16.0) / size;
+  
+    // Outside the glass -> Show untouched background
+    if (inversedSDF < 0.0) {
+        return float4(getTextureColorAt(fragCoord), 1.0);
+    }
+    
+    // Prevent normalize(0,0) NaN dead-center
+    float2 normalizedGlassCoord = length(glassCoord) > 0.0001 ? normalize(glassCoord) : float2(0.0, 0.0);
+    
+    // Step 3: Lens Distortion
+    float distFromCenter = 1.0 - clamp(inversedSDF / 0.3, 0.0, 1.0);
+    float distortion = 1.0 - sqrt(1.0 - pow(distFromCenter, 2.0));
+    float2 offset = distortion * normalizedGlassCoord * glassSize * 0.5;
+    float2 glassColorCoord = fragCoord - offset;
+
+    // Step 5: Dynamic Blur Intensity
+    float blurIntensity = 1.2;
+    // Scale up the radius slightly for Desktop resolution vs WebGL
+    float blurRadius = (blurIntensity * (1.0 - distFromCenter * 0.5)) * 4.0; 
+    
+    // Step 4: Chromatic Aberration
+    float edge = smoothstep(0.0, 0.02, inversedSDF);
+    float2 shift = normalizedGlassCoord * edge * 3.0;
+    
+    float3 glassColor = float3(
+      getBlurredColor(glassColorCoord - shift, blurRadius).r,
+      getBlurredColor(glassColorCoord, blurRadius).g,
+      getBlurredColor(glassColorCoord + shift, blurRadius).b
+    );
+
+    glassColor *= 0.90;  // Glass tint
+    return float4(glassColor, 1.0);
 }
 )";
 
-// --- LOGIC ---
 bool CaptureDesktopToTexture() {
     HDC screenDC = GetDC(nullptr);
     HDC memDC    = CreateCompatibleDC(screenDC);
@@ -180,7 +178,7 @@ bool CaptureDesktopToTexture() {
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth       = WINDOW_WIDTH;
-    bmi.bmiHeader.biHeight      = -WINDOW_HEIGHT; // Top-down
+    bmi.bmiHeader.biHeight      = -WINDOW_HEIGHT;
     bmi.bmiHeader.biPlanes      = 1;
     bmi.bmiHeader.biBitCount    = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -189,10 +187,8 @@ bool CaptureDesktopToTexture() {
     HBITMAP hbm = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HBITMAP oldHbm = (HBITMAP)SelectObject(memDC, hbm);
 
-    // Capture (Window itself is excluded via WDA_EXCLUDEFROMCAPTURE in WinMain)
     BitBlt(memDC, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, screenDC, wx, wy, SRCCOPY);
 
-    // Zero-copy Map/Unmap to update the GPU Texture
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (SUCCEEDED(g_ctx->Map(g_captureTex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         BYTE* dest = (BYTE*)mapped.pData;
@@ -305,13 +301,11 @@ bool InitD3D(HWND hwnd) {
     rsd.CullMode = D3D11_CULL_NONE;
     g_device->CreateRasterizerState(&rsd, &g_rsState);
 
-    // --- NEW: Create Dynamic Texture ONCE ---
     D3D11_TEXTURE2D_DESC td = {};
     td.Width            = WINDOW_WIDTH;
     td.Height           = WINDOW_HEIGHT;
     td.MipLevels        = 1;
     td.ArraySize        = 1;
-    // B8G8R8X8 format tells DX to ignore the alpha channel entirely. No CPU conversion needed!
     td.Format           = DXGI_FORMAT_B8G8R8X8_UNORM; 
     td.SampleDesc.Count = 1;
     td.Usage            = D3D11_USAGE_DYNAMIC;
@@ -432,7 +426,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    // Initialize COM for safe DirectX interactions
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     WNDCLASSEX wc = {};
@@ -444,7 +437,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassEx(&wc);
 
-    // Added WS_EX_NOREDIRECTIONBITMAP to support modern flip-model rendering
     g_hwnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
         L"LiquidGlass", L"Liquid Glass",
@@ -453,9 +445,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         nullptr, nullptr, hInst, nullptr
     );
 
-    // Prevents Hall-of-Mirrors feedback loop during BitBlt
     SetWindowDisplayAffinity(g_hwnd, WDA_EXCLUDEFROMCAPTURE);
-
     SetWindowTransparent(g_hwnd);
     
     if (!InitD3D(g_hwnd)) {
