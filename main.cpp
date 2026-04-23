@@ -18,6 +18,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "ole32.lib")
 
 // Added for newer Windows capture exclusion
 #ifndef WDA_EXCLUDEFROMCAPTURE
