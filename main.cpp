@@ -11,7 +11,6 @@
 #include <DirectXMath.h>
 #include <wrl/client.h>
 #include <string>
-#include <vector>
 #include <cmath>
 #include <chrono>
 
@@ -20,13 +19,18 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxgi.lib")
 
+// Added for newer Windows capture exclusion
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
 static const int WINDOW_WIDTH  = 420;
 static const int WINDOW_HEIGHT = 320;
-static float     g_time         = 0.0f;
-static HWND      g_hwnd         = nullptr;
+static float     g_time        = 0.0f;
+static HWND      g_hwnd        = nullptr;
 
 struct Vertex {
     XMFLOAT3 pos;
@@ -40,22 +44,24 @@ struct CBPerFrame {
     float pad;
 };
 
-ComPtr<ID3D11Device>           g_device;
-ComPtr<ID3D11DeviceContext>    g_ctx;
-ComPtr<IDXGISwapChain>         g_swapChain;
-ComPtr<ID3D11RenderTargetView> g_rtv;
-ComPtr<ID3D11Buffer>           g_vb;
-ComPtr<ID3D11Buffer>           g_ib;
-ComPtr<ID3D11Buffer>           g_cb;
-ComPtr<ID3D11VertexShader>     g_vs;
-ComPtr<ID3D11PixelShader>      g_ps;
-ComPtr<ID3D11InputLayout>      g_il;
-ComPtr<ID3D11Texture2D>        g_captureTex;
+// Global COM Objects
+ComPtr<ID3D11Device>             g_device;
+ComPtr<ID3D11DeviceContext>      g_ctx;
+ComPtr<IDXGISwapChain>           g_swapChain;
+ComPtr<ID3D11RenderTargetView>   g_rtv;
+ComPtr<ID3D11Buffer>             g_vb;
+ComPtr<ID3D11Buffer>             g_ib;
+ComPtr<ID3D11Buffer>             g_cb;
+ComPtr<ID3D11VertexShader>       g_vs;
+ComPtr<ID3D11PixelShader>        g_ps;
+ComPtr<ID3D11InputLayout>        g_il;
+ComPtr<ID3D11Texture2D>          g_captureTex;
 ComPtr<ID3D11ShaderResourceView> g_captureSRV;
-ComPtr<ID3D11SamplerState>     g_sampler;
-ComPtr<ID3D11BlendState>       g_blendState;
-ComPtr<ID3D11RasterizerState>  g_rsState;
+ComPtr<ID3D11SamplerState>       g_sampler;
+ComPtr<ID3D11BlendState>         g_blendState;
+ComPtr<ID3D11RasterizerState>    g_rsState;
 
+// --- SHADERS ---
 static const char* g_vsSource = R"(
 struct VSIn {
     float3 pos : POSITION;
@@ -122,6 +128,7 @@ float3 LiquidGlass(float2 uv, float2 resolution, float time) {
     float3 blurred = float3(0,0,0);
     int samples = 9;
     float2 px = float2(1.0f/gWidth, 1.0f/gHeight);
+    
     for(int x=-1;x<=1;x++){
         for(int y=-1;y<=1;y++){
             float2 off = float2(x,y)*px*blurStrength*120.0f;
@@ -161,12 +168,10 @@ float4 main(float4 svpos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 )";
 
+// --- LOGIC ---
 bool CaptureDesktopToTexture() {
     HDC screenDC = GetDC(nullptr);
     HDC memDC    = CreateCompatibleDC(screenDC);
-
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
 
     RECT wr; GetWindowRect(g_hwnd, &wr);
     int wx = wr.left, wy = wr.top;
@@ -174,56 +179,35 @@ bool CaptureDesktopToTexture() {
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth       = WINDOW_WIDTH;
-    bmi.bmiHeader.biHeight      = -WINDOW_HEIGHT;
+    bmi.bmiHeader.biHeight      = -WINDOW_HEIGHT; // Top-down
     bmi.bmiHeader.biPlanes      = 1;
     bmi.bmiHeader.biBitCount    = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
     void* bits = nullptr;
     HBITMAP hbm = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    SelectObject(memDC, hbm);
+    HBITMAP oldHbm = (HBITMAP)SelectObject(memDC, hbm);
 
+    // Capture (Window itself is excluded via WDA_EXCLUDEFROMCAPTURE in WinMain)
     BitBlt(memDC, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, screenDC, wx, wy, SRCCOPY);
 
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width            = WINDOW_WIDTH;
-    td.Height           = WINDOW_HEIGHT;
-    td.MipLevels        = 1;
-    td.ArraySize        = 1;
-    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage            = D3D11_USAGE_DEFAULT;
-    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-
-    BYTE* src = (BYTE*)bits;
-    std::vector<BYTE> rgba(WINDOW_WIDTH * WINDOW_HEIGHT * 4);
-    for (int i = 0; i < WINDOW_WIDTH * WINDOW_HEIGHT; i++) {
-        rgba[i*4+0] = src[i*4+0];
-        rgba[i*4+1] = src[i*4+1];
-        rgba[i*4+2] = src[i*4+2];
-        rgba[i*4+3] = 255;
+    // Zero-copy Map/Unmap to update the GPU Texture
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(g_ctx->Map(g_captureTex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        BYTE* dest = (BYTE*)mapped.pData;
+        BYTE* src = (BYTE*)bits;
+        for (int y = 0; y < WINDOW_HEIGHT; y++) {
+            memcpy(dest + (y * mapped.RowPitch), src + (y * WINDOW_WIDTH * 4), WINDOW_WIDTH * 4);
+        }
+        g_ctx->Unmap(g_captureTex.Get(), 0);
     }
 
-    D3D11_SUBRESOURCE_DATA sd = {};
-    sd.pSysMem     = rgba.data();
-    sd.SysMemPitch = WINDOW_WIDTH * 4;
-
-    g_captureTex.Reset();
-    g_captureSRV.Reset();
-
-    HRESULT hr = g_device->CreateTexture2D(&td, &sd, &g_captureTex);
-    if (FAILED(hr)) { DeleteObject(hbm); DeleteDC(memDC); ReleaseDC(nullptr, screenDC); return false; }
-
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
-    srvd.Format              = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srvd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvd.Texture2D.MipLevels = 1;
-    hr = g_device->CreateShaderResourceView(g_captureTex.Get(), &srvd, &g_captureSRV);
-
+    SelectObject(memDC, oldHbm);
     DeleteObject(hbm);
     DeleteDC(memDC);
     ReleaseDC(nullptr, screenDC);
-    return SUCCEEDED(hr);
+    
+    return true;
 }
 
 bool InitD3D(HWND hwnd) {
@@ -320,6 +304,29 @@ bool InitD3D(HWND hwnd) {
     rsd.CullMode = D3D11_CULL_NONE;
     g_device->CreateRasterizerState(&rsd, &g_rsState);
 
+    // --- NEW: Create Dynamic Texture ONCE ---
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width            = WINDOW_WIDTH;
+    td.Height           = WINDOW_HEIGHT;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    // B8G8R8X8 format tells DX to ignore the alpha channel entirely. No CPU conversion needed!
+    td.Format           = DXGI_FORMAT_B8G8R8X8_UNORM; 
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DYNAMIC;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags   = D3D11_CPU_ACCESS_WRITE;
+
+    hr = g_device->CreateTexture2D(&td, nullptr, &g_captureTex);
+    if (FAILED(hr)) return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+    srvd.Format              = DXGI_FORMAT_B8G8R8X8_UNORM;
+    srvd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MipLevels = 1;
+    hr = g_device->CreateShaderResourceView(g_captureTex.Get(), &srvd, &g_captureSRV);
+    if (FAILED(hr)) return false;
+
     return true;
 }
 
@@ -357,6 +364,7 @@ void Render() {
     g_ctx->PSSetConstantBuffers(0, 1, g_cb.GetAddressOf());
     g_ctx->PSSetShaderResources(0, 1, g_captureSRV.GetAddressOf());
     g_ctx->PSSetSamplers(0, 1, g_sampler.GetAddressOf());
+    
     float blendFactor[4] = {0,0,0,0};
     g_ctx->OMSetBlendState(g_blendState.Get(), blendFactor, 0xffffffff);
 
@@ -423,6 +431,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    // Initialize COM for safe DirectX interactions
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     WNDCLASSEX wc = {};
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = WndProc;
@@ -432,16 +443,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassEx(&wc);
 
+    // Added WS_EX_NOREDIRECTIONBITMAP to support modern flip-model rendering
     g_hwnd = CreateWindowEx(
-        WS_EX_LAYERED | WS_EX_TOPMOST,
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
         L"LiquidGlass", L"Liquid Glass",
         WS_POPUP,
         100, 100, WINDOW_WIDTH, WINDOW_HEIGHT,
         nullptr, nullptr, hInst, nullptr
     );
 
+    // Prevents Hall-of-Mirrors feedback loop during BitBlt
+    SetWindowDisplayAffinity(g_hwnd, WDA_EXCLUDEFROMCAPTURE);
+
     SetWindowTransparent(g_hwnd);
-    if (!InitD3D(g_hwnd)) return -1;
+    
+    if (!InitD3D(g_hwnd)) {
+        CoUninitialize();
+        return -1;
+    }
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
@@ -456,5 +475,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         Render();
     }
 done:
+    CoUninitialize();
     return (int)msg.wParam;
 }
